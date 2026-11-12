@@ -561,6 +561,47 @@ TEST_F(DeviceAdaptorTest, StreamWaitWriteValue64) {
             flagcxSuccess);
 }
 
+// A GEQ wait must also accept a strictly greater full-width value. An EQ
+// implementation would hang; run this test with the external timeout guard.
+TEST_F(DeviceAdaptorTest, StreamWaitValue64GreaterThan) {
+  ASSERT_NE(deviceAdaptor->streamWriteValue64, nullptr);
+  ASSERT_NE(deviceAdaptor->streamWaitValue64, nullptr);
+  void *deviceValue = nullptr;
+  ASSERT_EQ(devHandle->deviceMalloc(&deviceValue, sizeof(uint64_t),
+                                    flagcxMemDevice, nullptr), flagcxSuccess);
+  ASSERT_NE(deviceValue, nullptr);
+  ASSERT_EQ(devHandle->deviceMemset(deviceValue, 0, sizeof(uint64_t),
+                                    flagcxMemDevice, nullptr), flagcxSuccess);
+
+  constexpr uint64_t expected = (uint64_t{1} << 40) + 17;
+  constexpr uint64_t published = expected + 3;
+  flagcxResult_t result =
+      deviceAdaptor->streamWriteValue64(stream, deviceValue, published, 0);
+  if (result == flagcxNotSupported) {
+    EXPECT_EQ(devHandle->deviceFree(deviceValue, flagcxMemDevice, nullptr),
+              flagcxSuccess);
+    GTEST_SKIP() << "64-bit stream memory operations are not supported";
+  }
+  ASSERT_EQ(result, flagcxSuccess);
+  result = deviceAdaptor->streamWaitValue64(
+      stream, deviceValue, expected, FLAGCX_STREAM_WAIT_VALUE_DEFAULT);
+  if (result == flagcxNotSupported) {
+    EXPECT_EQ(devHandle->streamSynchronize(stream), flagcxSuccess);
+    EXPECT_EQ(devHandle->deviceFree(deviceValue, flagcxMemDevice, nullptr),
+              flagcxSuccess);
+    GTEST_SKIP() << "64-bit stream memory waits are not supported";
+  }
+  ASSERT_EQ(result, flagcxSuccess);
+  EXPECT_EQ(devHandle->streamSynchronize(stream), flagcxSuccess);
+  uint64_t actual = 0;
+  EXPECT_EQ(devHandle->deviceMemcpy(&actual, deviceValue, sizeof(actual),
+                                    flagcxMemcpyDeviceToHost, nullptr),
+            flagcxSuccess);
+  EXPECT_EQ(actual, published);
+  EXPECT_EQ(devHandle->deviceFree(deviceValue, flagcxMemDevice, nullptr),
+            flagcxSuccess);
+}
+
 // Test whether the adaptor can turn a stream wait into an acquire operation
 // for payload writes published by a remote GPU, NIC, or host proxy. Platforms
 // that cannot provide this guarantee must report flagcxNotSupported instead

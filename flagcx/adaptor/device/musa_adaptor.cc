@@ -4,6 +4,7 @@
 
 #include "adaptor.h"
 #include "alloc.h"
+#include <cstdint>
 
 std::map<flagcxMemcpyType_t, musaMemcpyKind> memcpy_type_map = {
     {flagcxMemcpyHostToDevice, musaMemcpyHostToDevice},
@@ -313,13 +314,92 @@ flagcxResult_t musaAdaptorGetDeviceByPciBusId(int *dev, const char *pciBusId) {
   return flagcxSuccess;
 }
 
-flagcxResult_t musaAdaptorStreamWaitValue64(flagcxStream_t, void *, uint64_t,
-                                            int) {
-  return flagcxNotSupported;
+// Adapt the native Stream MemOp path used by MooreThreads/mccl commit
+// 23edec5afda741efe0119410000dd80fd03092ef:
+//   src/ce_coll.cc: 64-bit MemOp capability and ordered signal writes;
+//   src/rma/rma_ce.cc: GEQ waits and remote-write flush capability;
+//   src/include/musawrap.h: native muStreamWait/WriteValue64 entry points.
+// Keep DefaultBackend; these operations do not require an MCCL communicator.
+namespace {
+
+flagcxResult_t musaStreamMemOpResult(MUresult result) {
+  if (result == MUSA_SUCCESS)
+    return flagcxSuccess;
+  if (result == MUSA_ERROR_NOT_SUPPORTED)
+    return flagcxNotSupported;
+  return flagcxUnhandledDeviceError;
 }
-flagcxResult_t musaAdaptorStreamWriteValue64(flagcxStream_t, void *, uint64_t,
-                                             int) {
-  return flagcxNotSupported;
+
+flagcxResult_t musaStreamMemOpCapability(MUdevice device,
+                                        MUdevice_attribute attribute) {
+  int supported = 0;
+  const MUresult result = muDeviceGetAttribute(&supported, attribute, device);
+  // Older drivers can reject an attribute they do not implement. Do not
+  // confuse context/device failures with a missing optional capability.
+  if (result == MUSA_ERROR_INVALID_VALUE || result == MUSA_ERROR_NOT_SUPPORTED)
+    return flagcxNotSupported;
+  if (result != MUSA_SUCCESS)
+    return flagcxUnhandledDeviceError;
+  return supported != 0 ? flagcxSuccess : flagcxNotSupported;
+}
+
+flagcxResult_t musaStreamMemOpCheck(bool flushRemoteWrites) {
+  MUdevice device;
+  const MUresult result = muCtxGetDevice(&device);
+  if (result != MUSA_SUCCESS)
+    return musaStreamMemOpResult(result);
+  flagcxResult_t capability = musaStreamMemOpCapability(
+      device, MU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS);
+  if (capability != flagcxSuccess)
+    return capability;
+  if (flushRemoteWrites)
+    return musaStreamMemOpCapability(
+        device, MU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES);
+  return flagcxSuccess;
+}
+
+} // namespace
+
+flagcxResult_t musaAdaptorStreamWaitValue64(flagcxStream_t stream, void *addr,
+                                            uint64_t value, int flags) {
+  if (stream == nullptr || addr == nullptr ||
+      (reinterpret_cast<uintptr_t>(addr) % alignof(uint64_t)) != 0)
+    return flagcxInvalidArgument;
+  if (flags & ~FLAGCX_STREAM_WAIT_VALUE_FLUSH_REMOTE_WRITES)
+    return flagcxInvalidArgument;
+
+  const bool flushRemoteWrites =
+      (flags & FLAGCX_STREAM_WAIT_VALUE_FLUSH_REMOTE_WRITES) != 0;
+  const flagcxResult_t capability = musaStreamMemOpCheck(flushRemoteWrites);
+  if (capability != flagcxSuccess)
+    return capability;
+
+  // Native GEQ follows the driver's cyclic sequence-number comparison,
+  // consistent with MCCL. Use counters with an outstanding distance < 2^63.
+  unsigned int waitFlags = MU_STREAM_WAIT_VALUE_GEQ;
+  if (flushRemoteWrites)
+    waitFlags |= MU_STREAM_WAIT_VALUE_FLUSH;
+  return musaStreamMemOpResult(muStreamWaitValue64(
+      reinterpret_cast<MUstream>(stream->base),
+      reinterpret_cast<MUdeviceptr>(addr), static_cast<muuint64_t>(value),
+      waitFlags));
+}
+
+flagcxResult_t musaAdaptorStreamWriteValue64(flagcxStream_t stream, void *addr,
+                                             uint64_t value, int flags) {
+  if (stream == nullptr || addr == nullptr ||
+      (reinterpret_cast<uintptr_t>(addr) % alignof(uint64_t)) != 0 || flags != 0)
+    return flagcxInvalidArgument;
+  const flagcxResult_t capability = musaStreamMemOpCheck(false);
+  if (capability != flagcxSuccess)
+    return capability;
+
+  // DEFAULT retains the native stream-scoped pre-write memory barrier.
+  // Do not select NO_MEMORY_BARRIER or replace this with a host-side store.
+  return musaStreamMemOpResult(muStreamWriteValue64(
+      reinterpret_cast<MUstream>(stream->base),
+      reinterpret_cast<MUdeviceptr>(addr), static_cast<muuint64_t>(value),
+      MU_STREAM_WRITE_VALUE_DEFAULT));
 }
 flagcxResult_t musaAdaptorEventElapsedTime(float *, flagcxEvent_t,
                                            flagcxEvent_t) {
