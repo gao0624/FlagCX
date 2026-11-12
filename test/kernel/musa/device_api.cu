@@ -71,9 +71,11 @@ getFlagcxDataTypeSizeDevice(flagcxDataType_t dtype) {
 
 // Intra-node AllReduce: each block reads from all peers via
 // flagcxGetIntraPointer, reduces (sum), and writes result back to all peers.
-template <typename T>
+// Concrete entry points avoid the template-kernel image-load failure
+// reproduced on mcc 5.1.0 / mp_31. Keep both datatype bodies identical
+// to the former template after substituting float or double.
 __global__ void __launch_bounds__(FLAGCX_DEVICE_THREADS_PER_CTA)
-    flagcxIntraAllReduceKernel(flagcxDevComm devComm, flagcxDevMem mem,
+    flagcxIntraAllReduceFloatKernel(flagcxDevComm devComm, flagcxDevMem mem,
                                size_t offset, size_t count) {
   // AllReduce requires peer pointer access (window or IPC)
   if (!mem.hasWindow())
@@ -98,36 +100,53 @@ __global__ void __launch_bounds__(FLAGCX_DEVICE_THREADS_PER_CTA)
   // Phase 1: Reduce — sum data from all intra-node peers
   // Phase 2: Write — store result to all intra-node peers
   for (size_t o = globalTid; o < count; o += globalNthreads) {
-    T v = T(0);
+    float v = float(0);
     for (int peer = 0; peer < nRanks; peer++)
-      v += *((T *)flagcxGetIntraPointer(mem, offset + o * sizeof(T), peer));
+      v += *((float *)flagcxGetIntraPointer(mem, offset + o * sizeof(float), peer));
     for (int peer = 0; peer < nRanks; peer++)
-      *((T *)flagcxGetIntraPointer(mem, offset + o * sizeof(T), peer)) = v;
+      *((float *)flagcxGetIntraPointer(mem, offset + o * sizeof(float), peer)) = v;
   }
 
   // Post-reduce barrier (release ordering — ensure writes are visible)
   bar.sync(flagcxDeviceMemoryOrderRelease);
 }
 
-// Host-side launcher
-template <typename T>
-static musaError_t launchFlagcxIntraAllReduce(flagcxDevComm devComm,
-                                              flagcxDevMem mem,
-                                              size_t offset, size_t count,
-                                              musaStream_t stream) {
-  flagcxIntraAllReduceKernel<T>
-      <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
-         stream>>>(devComm, mem, offset, count);
-  return musaGetLastError();
-}
+__global__ void __launch_bounds__(FLAGCX_DEVICE_THREADS_PER_CTA)
+    flagcxIntraAllReduceDoubleKernel(flagcxDevComm devComm, flagcxDevMem mem,
+                               size_t offset, size_t count) {
+  // AllReduce requires peer pointer access (window or IPC)
+  if (!mem.hasWindow())
+    return;
 
-// Explicit instantiations for common types
-template musaError_t launchFlagcxIntraAllReduce<float>(flagcxDevComm,
-                                                       flagcxDevMem, size_t,
-                                                       size_t, musaStream_t);
-template musaError_t launchFlagcxIntraAllReduce<double>(flagcxDevComm,
-                                                        flagcxDevMem, size_t,
-                                                        size_t, musaStream_t);
+  flagcxTeam intra = flagcxTeamIntra(devComm);
+  flagcxDevNet net(devComm, FLAGCX_BLOCK_IDX_X);
+
+  // Create barrier session using simplified FlagCX API (4 params).
+  flagcxDevBarrier<flagcxTeamTagIntra, flagcxCoopBlock> bar{
+      flagcxCoopBlock(), devComm, intra, FLAGCX_BLOCK_IDX_X};
+
+  // Pre-reduce barrier (acquire — ensure peer writes are visible)
+  bar.sync(flagcxDeviceMemoryOrderAcquire);
+
+  const int rank = devComm.getIntraRank();
+  const int nRanks = devComm.getIntraSize();
+  const int globalTid =
+      FLAGCX_THREAD_IDX_X + FLAGCX_BLOCK_DIM_X * (rank + FLAGCX_BLOCK_IDX_X * nRanks);
+  const int globalNthreads = FLAGCX_BLOCK_DIM_X * FLAGCX_GRID_DIM_X * nRanks;
+
+  // Phase 1: Reduce — sum data from all intra-node peers
+  // Phase 2: Write — store result to all intra-node peers
+  for (size_t o = globalTid; o < count; o += globalNthreads) {
+    double v = double(0);
+    for (int peer = 0; peer < nRanks; peer++)
+      v += *((double *)flagcxGetIntraPointer(mem, offset + o * sizeof(double), peer));
+    for (int peer = 0; peer < nRanks; peer++)
+      *((double *)flagcxGetIntraPointer(mem, offset + o * sizeof(double), peer)) = v;
+  }
+
+  // Post-reduce barrier (release ordering — ensure writes are visible)
+  bar.sync(flagcxDeviceMemoryOrderRelease);
+}
 
 // Host-side function — launches the kernel using caller-provided
 // registered buffer and device communicator.
@@ -148,12 +167,16 @@ flagcxResult_t launchKernelIntraAllReduce(flagcxDevMem_t devMem, size_t count,
   musaError_t err;
   switch (datatype) {
   case flagcxFloat32:
-    err = launchFlagcxIntraAllReduce<float>(devCommKernel, devMemKernel, 0,
-                                            count, musaStream);
+    flagcxIntraAllReduceFloatKernel
+        <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
+           musaStream>>>(devCommKernel, devMemKernel, 0, count);
+    err = musaGetLastError();
     break;
   case flagcxFloat64:
-    err = launchFlagcxIntraAllReduce<double>(devCommKernel, devMemKernel, 0,
-                                             count, musaStream);
+    flagcxIntraAllReduceDoubleKernel
+        <<<FLAGCX_DEVICE_CTA_COUNT, FLAGCX_DEVICE_THREADS_PER_CTA, 0,
+           musaStream>>>(devCommKernel, devMemKernel, 0, count);
+    err = musaGetLastError();
     break;
   default:
     return flagcxInvalidArgument;
@@ -1275,6 +1298,9 @@ FLAGCX_GLOBAL_DECORATOR void __launch_bounds__(FLAGCX_DEVICE_THREADS_PER_CTA)
   }
 }
 
+// Defined after all kernels so the diagnostic queries their actual host stubs.
+extern "C" int flagcxMusaDiagnoseDeviceApiImage();
+
 flagcxResult_t launchKernelCommQueries(flagcxDevMem_t devMem,
                                           flagcxDevComm_t devComm,
                                           int *results,
@@ -1285,6 +1311,7 @@ flagcxResult_t launchKernelCommQueries(flagcxDevMem_t devMem,
   const char *diagnostic = std::getenv("FLAGCX_MUSA_K1_DIAG");
   const bool diagnose = diagnostic && diagnostic[0] == '1';
   if (diagnose) {
+    (void)flagcxMusaDiagnoseDeviceApiImage();
     int device = -1;
     const musaError_t deviceError = musaGetDevice(&device);
     musaFuncAttributes attr{};
@@ -1591,4 +1618,45 @@ flagcxResult_t launchKernelNetGetFromComm(flagcxDevComm_t devComm, int *results,
       <<<1, 1, 0, *(musaStream_t *)stream>>>(dc, results);
   musaError_t err = musaGetLastError();
   return err == musaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
+}
+
+// Query existing kernels only: do not add a smoke kernel to the image being
+// investigated. This entry point also works before Comm/IPC initialization.
+extern "C" int flagcxMusaDiagnoseDeviceApiImage() {
+  int device = -1;
+  const musaError_t deviceError = musaGetDevice(&device);
+  if (deviceError != musaSuccess) {
+    std::fprintf(stderr, "MUSA image diagnostic: getDevice=%d (%s)\n",
+                 static_cast<int>(deviceError), musaGetErrorString(deviceError));
+    return 1;
+  }
+  struct Entry { const char *name; const void *function; };
+  const Entry entries[] = {
+      {"AllReduceFloat", reinterpret_cast<const void *>(flagcxIntraAllReduceFloatKernel)},
+      {"AllReduceDouble", reinterpret_cast<const void *>(flagcxIntraAllReduceDoubleKernel)},
+      {"CommQueries", reinterpret_cast<const void *>(flagcxIntraTestCommQueriesKernel)},
+      {"SymPtr", reinterpret_cast<const void *>(flagcxIntraTestSymPtrKernel)},
+      {"CoopGroups", reinterpret_cast<const void *>(flagcxIntraTestCoopGroupsKernel)},
+      {"NetGetFromComm", reinterpret_cast<const void *>(flagcxDevNetGetFromCommKernel)},
+  };
+  int failures = 0;
+  for (const auto &entry : entries) {
+    // Record and clear a prior runtime error so it cannot silently contaminate
+    // interpretation of the next attribute query. No work is enqueued here.
+    const musaError_t prior = musaGetLastError();
+    musaFuncAttributes attr{};
+    const musaError_t result = musaFuncGetAttributes(&attr, entry.function);
+    std::fprintf(stderr,
+        "MUSA image diagnostic: device=%d kernel=%s func=%p prior=%d "
+        "attributes=%d (%s) maxThreadsPerBlock=%d numRegs=%d "
+        "sharedBytes=%zu localBytes=%zu\n",
+        device, entry.name, entry.function, static_cast<int>(prior),
+        static_cast<int>(result), musaGetErrorString(result),
+        attr.maxThreadsPerBlock, attr.numRegs,
+        static_cast<size_t>(attr.sharedSizeBytes),
+        static_cast<size_t>(attr.localSizeBytes));
+    if (result != musaSuccess) ++failures;
+  }
+  std::fflush(stderr);
+  return failures ? 1 : 0;
 }
