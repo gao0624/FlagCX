@@ -31,6 +31,8 @@
 #include "global_comm.h"
 #include "flagcx_kernel.h"
 #include <musa_runtime.h>
+#include <cstdio>
+#include <cstdlib>
 
 // Datatype size helper (moved from flagcx/kernels/flagcx_kernel_device.cu)
 FLAGCX_DEVICE_DECORATOR size_t
@@ -1280,9 +1282,36 @@ flagcxResult_t launchKernelCommQueries(flagcxDevMem_t devMem,
   if (!devMem || !devComm || !results) return flagcxInternalError;
   flagcxDevMem dm(*devMem);
   flagcxDevComm dc(*devComm);
+  const char *diagnostic = std::getenv("FLAGCX_MUSA_K1_DIAG");
+  const bool diagnose = diagnostic && diagnostic[0] == '1';
+  if (diagnose) {
+    int device = -1;
+    const musaError_t deviceError = musaGetDevice(&device);
+    musaFuncAttributes attr{};
+    const musaError_t attrError = musaFuncGetAttributes(
+        &attr, reinterpret_cast<const void *>(flagcxIntraTestCommQueriesKernel));
+    std::fprintf(stderr,
+        "MUSA K1: device=%d getDevice=%d func=%p attributes=%d (%s) "
+        "maxThreadsPerBlock=%d numRegs=%d sharedBytes=%zu localBytes=%zu "
+        "launchThreads=32 stream=%p\n",
+        device, static_cast<int>(deviceError),
+        reinterpret_cast<const void *>(flagcxIntraTestCommQueriesKernel),
+        static_cast<int>(attrError), musaGetErrorString(attrError),
+        attr.maxThreadsPerBlock, attr.numRegs,
+        static_cast<size_t>(attr.sharedSizeBytes),
+        static_cast<size_t>(attr.localSizeBytes),
+        reinterpret_cast<void *>(*(musaStream_t *)stream));
+    std::fflush(stderr);
+    if (attrError != musaSuccess) return flagcxUnhandledDeviceError;
+  }
   flagcxIntraTestCommQueriesKernel
       <<<1, 32, 0, *(musaStream_t *)stream>>>(dm, dc, results);
   musaError_t err = musaGetLastError();
+  if (diagnose) {
+    std::fprintf(stderr, "MUSA K1: launch=%d (%s)\n",
+                 static_cast<int>(err), musaGetErrorString(err));
+    std::fflush(stderr);
+  }
   return err == musaSuccess ? flagcxSuccess : flagcxUnhandledDeviceError;
 }
 
