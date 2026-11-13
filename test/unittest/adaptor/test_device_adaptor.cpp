@@ -834,6 +834,10 @@ TEST_F(DeviceAdaptorTest, StreamCopyAndFree) {
 
 // Test: obtain the device-visible alias of mapped host memory.
 TEST_F(DeviceAdaptorTest, HostGetDevicePointer) {
+#ifdef USE_MUSA_ADAPTOR
+  // This is required by MUSA FIFO initialization, so do not silently skip it.
+  ASSERT_NE(devHandle->hostGetDevicePointer, nullptr);
+#endif
   if (devHandle->hostGetDevicePointer == nullptr) {
     GTEST_SKIP() << "hostGetDevicePointer not implemented for this backend";
   }
@@ -843,9 +847,29 @@ TEST_F(DeviceAdaptorTest, HostGetDevicePointer) {
       flagcxSuccess);
   ASSERT_NE(hostPtr, nullptr);
   void *devicePtr = nullptr;
-  EXPECT_EQ(devHandle->hostGetDevicePointer(&devicePtr, hostPtr),
-            flagcxSuccess);
+  auto result = devHandle->hostGetDevicePointer(&devicePtr, hostPtr);
+  EXPECT_EQ(result, flagcxSuccess);
   EXPECT_NE(devicePtr, nullptr);
+  if (result == flagcxSuccess && devicePtr != nullptr) {
+    // Exercise the device alias in both directions; pointer equality alone
+    // does not establish that this allocation is mapped for the device.
+    unsigned char copied[TEST_SIZE] = {};
+    memset(hostPtr, 0x35, TEST_SIZE);
+    EXPECT_EQ(devHandle->deviceMemcpy(copied, devicePtr, TEST_SIZE,
+                                      flagcxMemcpyDeviceToHost, nullptr,
+                                      nullptr),
+              flagcxSuccess);
+    EXPECT_EQ(memcmp(copied, hostPtr, TEST_SIZE), 0);
+    result = devHandle->deviceMemset(devicePtr, 0x6a, TEST_SIZE,
+                                     flagcxMemDevice, stream);
+    EXPECT_EQ(result, flagcxSuccess);
+    auto syncResult = devHandle->streamSynchronize(stream);
+    EXPECT_EQ(syncResult, flagcxSuccess);
+    if (result == flagcxSuccess && syncResult == flagcxSuccess) {
+      memset(copied, 0x6a, TEST_SIZE);
+      EXPECT_EQ(memcmp(hostPtr, copied, TEST_SIZE), 0);
+    }
+  }
   EXPECT_EQ(devHandle->hostGetDevicePointer(nullptr, hostPtr),
             flagcxInvalidArgument);
   EXPECT_EQ(devHandle->hostGetDevicePointer(&devicePtr, nullptr),

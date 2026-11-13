@@ -2649,6 +2649,12 @@ static flagcxResult_t flagcxKernelWorkerInit(void *state) {
   flagcxResult_t existingTerminal = flagcxSuccess;
   uint64_t generation = 1;
 
+  if (deviceAdaptor->hostGetDevicePointer == nullptr) {
+    WARN("flagcxKernelWorkerInit: hostGetDevicePointer not supported");
+    res = flagcxNotSupported;
+    goto done;
+  }
+
   // Set device context
   FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, done);
 

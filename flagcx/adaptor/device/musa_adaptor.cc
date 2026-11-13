@@ -48,7 +48,8 @@ flagcxResult_t musaAdaptorDeviceMalloc(void **ptr, size_t size,
                                        flagcxMemType_t type,
                                        flagcxStream_t stream) {
   if (type == flagcxMemHost) {
-    DEVCHECK(musaMallocHost(ptr, size));
+    // FIFOs and semaphores need a device-visible alias, not only pinned memory.
+    DEVCHECK(musaHostAlloc(ptr, size, musaHostAllocMapped));
   } else if (type == flagcxMemManaged) {
     DEVCHECK(musaMallocManaged(ptr, size, musaMemAttachGlobal));
   } else {
@@ -98,6 +99,16 @@ flagcxResult_t musaAdaptorGetDeviceCount(int *count) {
 
 flagcxResult_t musaAdaptorGetVendor(char *vendor) {
   strcpy(vendor, "MUSA");
+  return flagcxSuccess;
+}
+
+flagcxResult_t musaAdaptorHostGetDevicePointer(void **pDevice, void *pHost) {
+  if (pDevice == nullptr)
+    return flagcxInvalidArgument;
+  *pDevice = nullptr;
+  if (pHost == nullptr)
+    return flagcxInvalidArgument;
+  DEVCHECK(musaHostGetDevicePointer(pDevice, pHost, 0));
   return flagcxSuccess;
 }
 
@@ -450,7 +461,7 @@ struct flagcxDeviceAdaptor musaAdaptor {
       musaAdaptorDeviceSynchronize, musaAdaptorDeviceMemcpy,
       musaAdaptorDeviceMemset, musaAdaptorDeviceMalloc, musaAdaptorDeviceFree,
       musaAdaptorSetDevice, musaAdaptorGetDevice, musaAdaptorGetDeviceCount,
-      musaAdaptorGetVendor, NULL,
+      musaAdaptorGetVendor, musaAdaptorHostGetDevicePointer,
       // GDR functions
       NULL, // flagcxResult_t (*memHandleInit)(int dev_id, void **memHandle);
       NULL, // flagcxResult_t (*memHandleDestroy)(int dev, void *memHandle);
