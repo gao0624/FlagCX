@@ -1,19 +1,28 @@
 # Included by the root Makefile after DEVOBJ and build-config are resolved.
-# MUSA main-library kernels use the same split pipeline as test/kernel/musa.
+# Main-library device objects share one linked image, matching MCCL's device
+# glue pipeline. Only the owner host object embeds/registers that image; other
+# host objects contain launch stubs referencing the shared RDC module handle.
 MUSA_TOOLCHAIN_ROOT ?= $(abspath $(dir $(realpath $(DEVICE_COMPILER)))/..)
 MUSA_DEVICE_LD ?= $(MUSA_TOOLCHAIN_ROOT)/bin/lld
 MUSA_LTO_PLUGIN ?= $(MUSA_TOOLCHAIN_ROOT)/lib/LLVMgold.so
 MUSA_RESOURCE_DIR ?= $(shell $(DEVICE_COMPILER) -print-resource-dir)
 MUSA_TRAP_HANDLER ?= $(MUSA_RESOURCE_DIR)/lib/linux/trap_handler.o
 MUSA_DEVICE_OBJECTS := $(DEVOBJ:.o=.musa_device.o)
-MUSA_DEVICE_IMAGES := $(DEVOBJ:.o=.mubin)
+MUSA_DEVICE_IMAGE := $(OBJDIR)/flagcx/adaptor/kernel/musa/flagcx_device.mubin
+MUSA_IMAGE_OWNER_SRC := flagcx/adaptor/kernel/musa/device_api_host_helpers.cu
+MUSA_IMAGE_OWNER_OBJ := $(patsubst %.cu,$(OBJDIR)/%.o,$(MUSA_IMAGE_OWNER_SRC))
+MUSA_HOST_STUB_OBJECTS := $(filter-out $(MUSA_IMAGE_OWNER_OBJ),$(DEVOBJ))
+
+ifeq ($(filter $(MUSA_IMAGE_OWNER_OBJ),$(DEVOBJ)),)
+$(error MUSA combined device image requires $(MUSA_IMAGE_OWNER_SRC) in PLATFORM_KERNEL_SRCS)
+endif
 MUSA_KERNEL_INCLUDES := $(foreach dir,$(INCLUDEDIR),-I$(dir)) \
 	-I$(CCL_INCLUDE) $(addprefix -I,$(DEVICE_INCLUDE)) \
 	-I$(HOST_CCL_INCLUDE) -I$(UCX_INCLUDE) $(SHCA_INCLUDE_FLAG)
 MUSA_KERNEL_DEFINES := $(ADAPTOR_FLAG) $(HOST_CCL_ADAPTOR_FLAG) \
 	$(NET_ADAPTOR_FLAG) $(COMPILE_KERNEL_FLAG)
 
-.SECONDARY: $(MUSA_DEVICE_OBJECTS) $(MUSA_DEVICE_IMAGES)
+.SECONDARY: $(MUSA_DEVICE_OBJECTS) $(MUSA_DEVICE_IMAGE)
 .DELETE_ON_ERROR:
 
 $(MUSA_DEVICE_OBJECTS): $(OBJDIR)/%.musa_device.o: %.cu Makefile makefiles/musa.mk makefiles/musa_kernel_rules.mk $(BUILD_CONFIG_FILE)
@@ -21,15 +30,25 @@ $(MUSA_DEVICE_OBJECTS): $(OBJDIR)/%.musa_device.o: %.cu Makefile makefiles/musa.
 	$(DEVICE_COMPILER) $(DEVICE_COMPILE_FLAG) $(MUSA_KERNEL_INCLUDES) \
 		$(MUSA_KERNEL_DEFINES) --cuda-device-only -o $@ $<
 
-$(MUSA_DEVICE_IMAGES): $(OBJDIR)/%.mubin: $(OBJDIR)/%.musa_device.o $(MUSA_TRAP_HANDLER) makefiles/musa_kernel_rules.mk
+$(MUSA_DEVICE_IMAGE): $(MUSA_DEVICE_OBJECTS) $(MUSA_TRAP_HANDLER) makefiles/musa_kernel_rules.mk
+	@mkdir -p $(dir $@)
 	$(MUSA_DEVICE_LD) -flavor gnu --no-undefined \
 		-plugin $(MUSA_LTO_PLUGIN) -plugin-opt=mcpu=$(MUSA_ARCH) -plugin-opt=O2 \
-		$< $(MUSA_TRAP_HANDLER) -o $@
+		$(MUSA_DEVICE_OBJECTS) $(MUSA_TRAP_HANDLER) -o $@
 
-$(DEVOBJ): $(OBJDIR)/%.o: %.cu $(OBJDIR)/%.mubin makefiles/musa_kernel_rules.mk
+# Embed the complete image exactly once. Keep RDC for all host passes: MCCL
+# uses the same arrangement for its image owner and the remaining host stubs.
+$(MUSA_IMAGE_OWNER_OBJ): $(OBJDIR)/%.o: %.cu $(MUSA_DEVICE_IMAGE) makefiles/musa_kernel_rules.mk $(BUILD_CONFIG_FILE)
 	$(DEVICE_COMPILER) $(DEVICE_COMPILE_FLAG) $(MUSA_KERNEL_INCLUDES) \
 		$(MUSA_KERNEL_DEFINES) --cuda-host-only \
-		-Xclang -fcuda-include-gpubinary -Xclang $(OBJDIR)/$*.mubin -o $@ $<
+		-Xclang -fcuda-include-gpubinary -Xclang $(MUSA_DEVICE_IMAGE) -o $@ $<
+
+ifneq ($(strip $(MUSA_HOST_STUB_OBJECTS)),)
+$(MUSA_HOST_STUB_OBJECTS): $(OBJDIR)/%.o: %.cu makefiles/musa_kernel_rules.mk $(BUILD_CONFIG_FILE)
+	@mkdir -p $(dir $@)
+	$(DEVICE_COMPILER) $(DEVICE_COMPILE_FLAG) $(MUSA_KERNEL_INCLUDES) \
+		$(MUSA_KERNEL_DEFINES) --cuda-host-only -o $@ $<
+endif
 
 ifneq ($(BUILD_CONFIG_CHANGED),)
 $(MUSA_DEVICE_OBJECTS): build_config_force
