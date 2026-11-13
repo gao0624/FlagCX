@@ -856,8 +856,7 @@ TEST_F(DeviceAdaptorTest, HostGetDevicePointer) {
     unsigned char copied[TEST_SIZE] = {};
     memset(hostPtr, 0x35, TEST_SIZE);
     EXPECT_EQ(devHandle->deviceMemcpy(copied, devicePtr, TEST_SIZE,
-                                      flagcxMemcpyDeviceToHost, nullptr,
-                                      nullptr),
+                                      flagcxMemcpyDeviceToHost, nullptr),
               flagcxSuccess);
     EXPECT_EQ(memcmp(copied, hostPtr, TEST_SIZE), 0);
     result = devHandle->deviceMemset(devicePtr, 0x6a, TEST_SIZE,

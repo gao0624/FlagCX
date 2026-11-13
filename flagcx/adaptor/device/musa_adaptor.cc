@@ -253,32 +253,50 @@ flagcxResult_t musaAdaptorEventQuery(flagcxEvent_t event) {
   return res;
 }
 
+// The wrapper owns the exported handle bytes, not the device allocation.
 flagcxResult_t musaAdaptorIpcMemHandleCreate(flagcxIpcMemHandle_t *handle,
-                                             size_t *size) {
-  // to be implemented
-  return flagcxNotSupported;
+                                          size_t *size) {
+  if (handle == nullptr)
+    return flagcxInvalidArgument;
+  *handle = nullptr;
+  if (size != nullptr)
+    *size = sizeof(musaIpcMemHandle_t);
+  static_assert(sizeof(flagcxIpcMemHandle) == sizeof(musaIpcMemHandle_t),
+                "IPC wrapper must contain only the native transferable handle");
+  *handle = static_cast<flagcxIpcMemHandle_t>(calloc(1, sizeof(**handle)));
+  return *handle != nullptr ? flagcxSuccess : flagcxSystemError;
 }
 
 flagcxResult_t musaAdaptorIpcMemHandleGet(flagcxIpcMemHandle_t handle,
-                                          void *devPtr) {
-  // to be implemented
-  return flagcxNotSupported;
+                                       void *devPtr) {
+  if (handle == nullptr || devPtr == nullptr)
+    return flagcxInvalidArgument;
+  DEVCHECK(musaIpcGetMemHandle(&handle->base, devPtr));
+  return flagcxSuccess;
 }
 
 flagcxResult_t musaAdaptorIpcMemHandleOpen(flagcxIpcMemHandle_t handle,
-                                           void **devPtr) {
-  // to be implemented
-  return flagcxNotSupported;
+                                        void **devPtr) {
+  if (devPtr == nullptr)
+    return flagcxInvalidArgument;
+  *devPtr = nullptr;
+  if (handle == nullptr)
+    return flagcxInvalidArgument;
+  DEVCHECK(musaIpcOpenMemHandle(devPtr, handle->base,
+                              musaIpcMemLazyEnablePeerAccess));
+  return flagcxSuccess;
 }
 
 flagcxResult_t musaAdaptorIpcMemHandleClose(void *devPtr) {
-  // to be implemented
-  return flagcxNotSupported;
+  if (devPtr == nullptr)
+    return flagcxInvalidArgument;
+  DEVCHECK(musaIpcCloseMemHandle(devPtr));
+  return flagcxSuccess;
 }
 
 flagcxResult_t musaAdaptorIpcMemHandleFree(flagcxIpcMemHandle_t handle) {
-  // to be implemented
-  return flagcxNotSupported;
+  free(handle);
+  return flagcxSuccess;
 }
 
 flagcxResult_t musaAdaptorLaunchHostFunc(flagcxStream_t stream,
